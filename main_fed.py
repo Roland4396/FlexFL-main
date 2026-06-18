@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from Algorithm.Training_Decoupled import Decoupled
 from Algorithm.Training_FlexFL import FlexFL
+from Algorithm.Training_FedRolex import FedRolex
 from Algorithm.Training_ScaleFL import ScaleFL
 from getAPOZ import hook
 from models.transformer import Transformer
@@ -19,16 +20,17 @@ from utils.Clients import Clients
 from utils.options import args_parser
 from models import *
 from utils.get_dataset import get_dataset
-from utils.utils import save_result
+from utils.utils import save_model_checkpoints, save_result
 from utils.set_seed import set_random_seed
 from Algorithm import *
+from arch_profiles import build_smallest_width_model, supports_aligned_profiles
 
 import ssl
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
 
-def FedAvg(net_glob, dataset_train, dataset_test, dict_users, run):
+def FedAvg(net_glob, dataset_train, dataset_test, dict_users, run=None):
     net_glob.train()
     print(net_glob)
 
@@ -60,9 +62,15 @@ def FedAvg(net_glob, dataset_train, dataset_test, dict_users, run):
         net_glob.load_state_dict(w_glob)
 
         acc.append(test(net_glob, dataset_test, args))
-        if args.e:
+        if args.e and (run is not None or not args.log):
             hook(args, net_glob, copy.deepcopy(dataset_test), iter + 1, run)
     save_result(acc, 'test_acc', args)
+    save_model_checkpoints(
+        args,
+        [net_glob],
+        names=["global"],
+        metadata={"accuracies": acc},
+    )
 
 
 def FedProx(net_glob, dataset_train, dataset_test, dict_users):
@@ -94,6 +102,12 @@ def FedProx(net_glob, dataset_train, dataset_test, dict_users):
         acc.append(test(net_glob, dataset_test, args))
 
     save_result(acc, 'test_acc', args)
+    save_model_checkpoints(
+        args,
+        [net_glob],
+        names=["global"],
+        metadata={"accuracies": acc, "prox_alpha": args.prox_alpha},
+    )
 
 
 if __name__ == '__main__':
@@ -106,7 +120,9 @@ if __name__ == '__main__':
     dataset_train, dataset_test, dict_users = get_dataset(args)
     # plot_client_distribution(dataset_train, dict_users)
 
-    if args.model == 'cnn':
+    if args.algorithm in {'FedAvg', 'FedProx'} and supports_aligned_profiles(args):
+        net_glob = build_smallest_width_model(args)
+    elif args.model == 'cnn':
         if args.dataset == 'femnist':
             net_glob = CNNFashionMnist(args)
         elif args.dataset == 'mnist':
@@ -124,6 +140,13 @@ if __name__ == '__main__':
             net_glob = ResNet18_cifar(num_channels=args.num_channels, num_classes=args.num_classes)
     elif 'mobilenet' in args.model:
         net_glob = MobileNetV2(args.num_channels, args.num_classes)
+    elif args.model == 'vit':
+        net_glob = vit_small_flexfl(
+            num_classes=args.num_classes,
+            num_channels=args.num_channels,
+            image_size=args.image_size,
+            rate=[1.0] * 4,
+        )
     elif 'vgg' in args.model:
         net_glob = vgg_16_bn(num_classes=args.num_classes, track_running_stats=True, num_channels=args.num_channels)
     elif 'lstm' in args.model:
@@ -136,6 +159,7 @@ if __name__ == '__main__':
         net_glob.to(args.device)
         FedAvg(net_glob, dataset_train, dataset_test, dict_users)
     elif args.algorithm == 'FedProx':
+        net_glob.to(args.device)
         FedProx(net_glob, dataset_train, dataset_test, dict_users)
     elif args.algorithm == 'HeteroFL':
         HeteroFL(args, dataset_train, dataset_test, dict_users)
@@ -145,5 +169,7 @@ if __name__ == '__main__':
         Decoupled(args, dataset_train, dataset_test, dict_users)
     elif args.algorithm == 'FlexFL':
         FlexFL(args, dataset_train, dataset_test, dict_users)
+    elif args.algorithm == 'FedRolex':
+        FedRolex(args, dataset_train, dataset_test, dict_users)
     else:
         raise "%s algorithm has not achieved".format(args.algorithm)

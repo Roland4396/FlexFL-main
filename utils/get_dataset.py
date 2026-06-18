@@ -22,12 +22,39 @@ import json
 from collections import Counter
 
 
+def _format_beta_suffix(beta):
+    beta_float = float(beta)
+    if beta_float.is_integer():
+        return str(int(beta_float))
+    return str(beta_float)
+
+
+def _is_vit(args):
+    return getattr(args, "model", None) == "vit"
+
+
+def _vit_transforms(mean, std, image_size):
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(image_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    eval_transform = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    return train_transform, eval_transform
+
+
 def get_dataset(args):
     file = os.path.join("data", args.dataset + "_" + str(args.num_users))
     if args.iid:
         file += "_iid"
     else:
-        file += "_noniid_beta" + str(args.data_beta)
+        file += "_noniid_beta" + _format_beta_suffix(args.data_beta)
 
     file += ".json"
     # load dataset and split users
@@ -46,12 +73,19 @@ def get_dataset(args):
     elif args.dataset == 'cifar10':
         args.num_channels = 3
         args.num_classes = 10
-        trans_cifar10_train = transforms.Compose([transforms.ToTensor(),
-                                                  transforms.Normalize(mean=[0.491, 0.482, 0.447],
-                                                                       std=[0.247, 0.243, 0.262])])
-        trans_cifar10_val = transforms.Compose([transforms.ToTensor(),
-                                                transforms.Normalize(mean=[0.491, 0.482, 0.447],
-                                                                     std=[0.247, 0.243, 0.262])])
+        if _is_vit(args):
+            trans_cifar10_train, trans_cifar10_val = _vit_transforms(
+                mean=[0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5],
+                image_size=args.image_size,
+            )
+        else:
+            trans_cifar10_train = transforms.Compose([transforms.ToTensor(),
+                                                      transforms.Normalize(mean=[0.491, 0.482, 0.447],
+                                                                           std=[0.247, 0.243, 0.262])])
+            trans_cifar10_val = transforms.Compose([transforms.ToTensor(),
+                                                    transforms.Normalize(mean=[0.491, 0.482, 0.447],
+                                                                         std=[0.247, 0.243, 0.262])])
 
         dataset_train = datasets.CIFAR10('./data/cifar10', train=True, download=True, transform=trans_cifar10_train)
         dataset_test = datasets.CIFAR10('./data/cifar10', train=False, download=True, transform=trans_cifar10_val)
@@ -67,12 +101,19 @@ def get_dataset(args):
     elif args.dataset == 'cifar100':
         args.num_channels = 3
         args.num_classes = 100
-        trans_cifar100_train = transforms.Compose([transforms.ToTensor(),
-                                                   transforms.Normalize(mean=[0.507, 0.487, 0.441],
-                                                                        std=[0.267, 0.256, 0.276])])
-        trans_cifar100_val = transforms.Compose([transforms.ToTensor(),
-                                                 transforms.Normalize(mean=[0.507, 0.487, 0.441],
-                                                                      std=[0.267, 0.256, 0.276])])
+        if _is_vit(args):
+            trans_cifar100_train, trans_cifar100_val = _vit_transforms(
+                mean=[0.5, 0.5, 0.5],
+                std=[0.5, 0.5, 0.5],
+                image_size=args.image_size,
+            )
+        else:
+            trans_cifar100_train = transforms.Compose([transforms.ToTensor(),
+                                                       transforms.Normalize(mean=[0.507, 0.487, 0.441],
+                                                                            std=[0.267, 0.256, 0.276])])
+            trans_cifar100_val = transforms.Compose([transforms.ToTensor(),
+                                                     transforms.Normalize(mean=[0.507, 0.487, 0.441],
+                                                                          std=[0.267, 0.256, 0.276])])
         dataset_train = datasets.CIFAR100('./data/cifar100', train=True, download=True, transform=trans_cifar100_train)
         dataset_test = datasets.CIFAR100('./data/cifar100', train=False, download=True, transform=trans_cifar100_val)
         if args.generate_data:
@@ -115,15 +156,22 @@ def get_dataset(args):
 
     elif args.dataset == 'TinyImagenet':
 
-        trans_imagenet_train = transforms.Compose([transforms.RandomCrop(64),
-                                                   transforms.RandomHorizontalFlip(),
-                                                   transforms.ToTensor(),
-                                                   transforms.Normalize(mean=[0.4802, 0.4481, 0.3975],
-                                                                        std=[0.2770, 0.2691, 0.2821])])
-        trans_imagenet_val = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.4802, 0.4481, 0.3975],
-                                 std=[0.2770, 0.2691, 0.2821])])
+        if _is_vit(args):
+            trans_imagenet_train, trans_imagenet_val = _vit_transforms(
+                mean=[0.4802, 0.4481, 0.3975],
+                std=[0.2770, 0.2691, 0.2821],
+                image_size=args.image_size,
+            )
+        else:
+            trans_imagenet_train = transforms.Compose([transforms.RandomCrop(64),
+                                                       transforms.RandomHorizontalFlip(),
+                                                       transforms.ToTensor(),
+                                                       transforms.Normalize(mean=[0.4802, 0.4481, 0.3975],
+                                                                            std=[0.2770, 0.2691, 0.2821])])
+            trans_imagenet_val = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.4802, 0.4481, 0.3975],
+                                     std=[0.2770, 0.2691, 0.2821])])
         # 自动下载 TinyImageNet
         data_dir = './data'
         tinyimagenet_path = './data/tiny-imagenet-200/'

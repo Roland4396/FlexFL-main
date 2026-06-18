@@ -14,6 +14,39 @@ from models.Fed import split_model
 from optimizer.Adabelief import AdaBelief
 
 
+def _filter_state_by_grad(net):
+    grad_names = {name for name, param in net.named_parameters() if param.grad is not None}
+    if not grad_names:
+        return net.state_dict()
+    state = net.state_dict()
+    filtered = {}
+    for name, value in state.items():
+        if name in grad_names or "running" in name or "num_batches_tracked" in name:
+            filtered[name] = value
+    return filtered
+
+
+def _should_filter_inactive_vit(args):
+    return args.model == "vit" and args.algorithm in {"HeteroFL", "FlexFL"}
+
+
+def _build_optimizer(args, parameters, round_idx):
+    if args.optimizer == 'sgd':
+        return torch.optim.SGD(
+            parameters,
+            lr=args.lr * (args.lr_decay ** round_idx),
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    if args.optimizer == 'adam':
+        return torch.optim.Adam(parameters, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == 'adamw':
+        return torch.optim.AdamW(parameters, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == 'adaBelief':
+        return AdaBelief(parameters, lr=args.lr)
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
 class DatasetSplit(Dataset):
     def __init__(self, dataset, idxs, args):
         self.dataset = dataset
@@ -42,7 +75,7 @@ class KDLoss(nn.Module):
         self.softmax = nn.Softmax(dim=1)
 
         self.T = int(args.T)
-        self.gamma = int(args.gamma)
+        self.gamma = float(args.gamma)
 
     def loss_fn_kd(self, pred, target, soft_target, gamma_active=True):
         _ce = self.ce_loss(pred, target)
@@ -76,14 +109,7 @@ class LocalUpdate_ScaleFL(object):
     def train(self, round, net, ee):
 
         net.train()
-        # train and update
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr * (self.args.lr_decay ** round),
-                                        momentum=self.args.momentum, weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.args.lr)
-        elif self.args.optimizer == 'adaBelief':
-            optimizer = AdaBelief(net.parameters(), lr=self.args.lr)
+        optimizer = _build_optimizer(self.args, net.parameters(), round)
 
         Predict_loss = 0
         for iter in range(self.args.local_ep):
@@ -114,9 +140,15 @@ class LocalUpdate_ScaleFL(object):
             info = '\nUser predict Loss={:.4f}'.format(Predict_loss / (self.args.local_ep * len(self.ldr_train)))
             print(info)
 
-        requires_grad = []
-        for param in net.parameters():
-            requires_grad.append(param.grad != None)
+        try:
+            named_parameters = net.named_parameters(remove_duplicate=False)
+        except TypeError:
+            named_parameters = net.named_parameters()
+
+        requires_grad = {
+            name: param.grad is not None
+            for name, param in named_parameters
+        }
 
         return net.state_dict(), requires_grad
 
@@ -133,14 +165,7 @@ class LocalUpdate_FedAvg(object):
     def train(self, round, net):
 
         net.train()
-        # train and update
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr * (self.args.lr_decay ** round),
-                                        momentum=self.args.momentum, weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.args.lr)
-        elif self.args.optimizer == 'adaBelief':
-            optimizer = AdaBelief(net.parameters(), lr=self.args.lr)
+        optimizer = _build_optimizer(self.args, net.parameters(), round)
 
         Predict_loss = 0
         for iter in range(self.args.local_ep):
@@ -172,6 +197,8 @@ class LocalUpdate_FedAvg(object):
             info = '\nUser predict Loss={:.4f}'.format(Predict_loss / (self.args.local_ep * len(self.ldr_train)))
             print(info)
 
+        if _should_filter_inactive_vit(self.args):
+            return _filter_state_by_grad(net)
         return net.state_dict()
 
 
@@ -187,14 +214,7 @@ class LocalUpdate_FlexFL(object):
     def train(self, round, net, globList, modelLevel=2):
 
         net.train()
-        # train and update
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr * (self.args.lr_decay ** round),
-                                        momentum=self.args.momentum, weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.args.lr)
-        elif self.args.optimizer == 'adaBelief':
-            optimizer = AdaBelief(net.parameters(), lr=self.args.lr)
+        optimizer = _build_optimizer(self.args, net.parameters(), round)
 
         Predict_loss = 0
         for iter in range(self.args.local_ep):
@@ -217,6 +237,8 @@ class LocalUpdate_FlexFL(object):
             info = '\nUser predict Loss={:.4f}'.format(Predict_loss / (self.args.local_ep * len(self.ldr_train)))
             print(info)
 
+        if _should_filter_inactive_vit(self.args):
+            return _filter_state_by_grad(net)
         return net.state_dict()
 
 
@@ -231,14 +253,7 @@ class LocalUpdate_FedSlim(object):
     def train(self, round, net):
 
         net.train()
-        # train and update
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr * (self.args.lr_decay ** round),
-                                        momentum=self.args.momentum, weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.args.lr)
-        elif self.args.optimizer == 'adaBelief':
-            optimizer = AdaBelief(net.parameters(), lr=self.args.lr)
+        optimizer = _build_optimizer(self.args, net.parameters(), round)
 
         Predict_loss = 0
         for iter in range(self.args.local_ep):
@@ -259,6 +274,8 @@ class LocalUpdate_FedSlim(object):
             info = '\nUser predict Loss={:.4f}'.format(Predict_loss / (self.args.local_ep * len(self.ldr_train)))
             print(info)
 
+        if _should_filter_inactive_vit(self.args):
+            return _filter_state_by_grad(net)
         return net.state_dict()
 
 
@@ -268,23 +285,16 @@ class LocalUpdate_FedProx(object):
         self.loss_func = nn.CrossEntropyLoss()
         self.ensemble_loss = nn.KLDivLoss(reduction="batchmean")
         self.selected_clients = []
-        self.ldr_train = DataLoader(DatasetSplit(dataset, idxs), batch_size=self.args.local_bs, shuffle=True,
+        self.ldr_train = DataLoader(DatasetSplit(dataset, idxs, args), batch_size=self.args.local_bs, shuffle=True,
                                     drop_last=True)
-        self.glob_model = glob_model
+        self.glob_model = copy.deepcopy(glob_model).to(args.device)
         self.prox_alpha = args.prox_alpha
         self.verbose = verbose
 
     def train(self, round, net):
 
         net.train()
-        # train and update
-        if self.args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(net.parameters(), lr=self.args.lr * (self.args.lr_decay ** round),
-                                        momentum=self.args.momentum, weight_decay=self.args.weight_decay)
-        elif self.args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.args.lr)
-        elif self.args.optimizer == 'adaBelief':
-            optimizer = AdaBelief(net.parameters(), lr=self.args.lr)
+        optimizer = _build_optimizer(self.args, net.parameters(), round)
 
         Predict_loss = 0
         Penalize_loss = 0

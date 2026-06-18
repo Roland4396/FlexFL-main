@@ -14,6 +14,85 @@ from .resnet import ResNet18_cifar
 from .vgg import vgg_16_bn
 
 
+def _prefix_slices(tensor, target_shape):
+    slices = tuple(slice(0, dim) for dim in target_shape)
+    return tensor[slices]
+
+
+def _is_qkv_weight(key, tensor):
+    return key.endswith(".attn.in_proj_weight") and tensor.dim() == 2 and tensor.size(0) % 3 == 0
+
+
+def _is_qkv_bias(key, tensor):
+    return key.endswith(".attn.in_proj_bias") and tensor.dim() == 1 and tensor.size(0) % 3 == 0
+
+
+def _slice_qkv_weight(source, target_shape):
+    source_qkv_dim = source.size(0) // 3
+    target_qkv_dim = target_shape[0] // 3
+    target_in_dim = target_shape[1]
+    pieces = []
+    for offset in (0, source_qkv_dim, source_qkv_dim * 2):
+        pieces.append(source[offset:offset + target_qkv_dim, :target_in_dim])
+    return torch.cat(pieces, dim=0)
+
+
+def _slice_qkv_bias(source, target_shape):
+    source_qkv_dim = source.size(0) // 3
+    target_qkv_dim = target_shape[0] // 3
+    pieces = []
+    for offset in (0, source_qkv_dim, source_qkv_dim * 2):
+        pieces.append(source[offset:offset + target_qkv_dim])
+    return torch.cat(pieces, dim=0)
+
+
+def _slice_param(key, source, target_shape):
+    if _is_qkv_weight(key, source):
+        return _slice_qkv_weight(source, target_shape)
+    if _is_qkv_bias(key, source):
+        return _slice_qkv_bias(source, target_shape)
+    return _prefix_slices(source, target_shape)
+
+
+def _accumulate_qkv_weight(tmp_v, count_v, local_v, sample_count):
+    global_qkv_dim = tmp_v.size(0) // 3
+    local_qkv_dim = local_v.size(0) // 3
+    local_in_dim = local_v.size(1)
+    for local_offset, global_offset in zip(
+        (0, local_qkv_dim, local_qkv_dim * 2),
+        (0, global_qkv_dim, global_qkv_dim * 2),
+    ):
+        target = (slice(global_offset, global_offset + local_qkv_dim), slice(0, local_in_dim))
+        source = (slice(local_offset, local_offset + local_qkv_dim), slice(0, local_in_dim))
+        tmp_v[target] += local_v[source] * sample_count
+        count_v[target] += sample_count
+
+
+def _accumulate_qkv_bias(tmp_v, count_v, local_v, sample_count):
+    global_qkv_dim = tmp_v.size(0) // 3
+    local_qkv_dim = local_v.size(0) // 3
+    for local_offset, global_offset in zip(
+        (0, local_qkv_dim, local_qkv_dim * 2),
+        (0, global_qkv_dim, global_qkv_dim * 2),
+    ):
+        target = slice(global_offset, global_offset + local_qkv_dim)
+        source = slice(local_offset, local_offset + local_qkv_dim)
+        tmp_v[target] += local_v[source] * sample_count
+        count_v[target] += sample_count
+
+
+def _accumulate_param(key, tmp_v, count_v, local_v, sample_count):
+    if _is_qkv_weight(key, tmp_v):
+        _accumulate_qkv_weight(tmp_v, count_v, local_v, sample_count)
+        return
+    if _is_qkv_bias(key, tmp_v):
+        _accumulate_qkv_bias(tmp_v, count_v, local_v, sample_count)
+        return
+    slices = tuple(slice(0, dim) for dim in local_v.shape)
+    tmp_v[slices] += local_v * sample_count
+    count_v[slices] += sample_count
+
+
 def Aggregation(w, lens):
     w_avg = None
     total_count = sum(lens)
@@ -40,16 +119,10 @@ def split_model(global_param, slim_param):
         if k not in global_param:
             # 如果不存在（例如小模型有shortcut但大模型没有），跳过
             continue
-
-        if v.dim() > 1:
-            d1 = v.shape[0]
-            d2 = v.shape[1]
-            param[k] = global_param[k][:d1, :d2]
-        elif v.dim() == 1:
-            d1 = v.shape[0]
-            param[k] = global_param[k][:d1]
-        else:
+        if v.dim() == 0:
             param[k] = global_param[k]
+            continue
+        param[k] = _slice_param(k, global_param[k], v.shape)
     return param
 
 
@@ -62,20 +135,13 @@ def Aggregation_FedSlim(w, lens, global_model_param):
         count[k] = v.new_zeros(v.size(), dtype=torch.float32)
         tmp_v = v.new_zeros(v.size(), dtype=torch.float32)
         for m in range(len(w)):  # 遍历所有用户
-            if parameter_type == 'weight':
-                if v.dim() > 1:  # 卷积  和 线性层
-                    d1 = w[m][k].shape[0]
-                    d2 = w[m][k].shape[1]
-                    tmp_v[:d1, :d2] += w[m][k] * lens[m]  # 第m个客户端的 k 层参数
-                    count[k][:d1, :d2] += lens[m]
-                else:  # BN层
-                    d1 = w[m][k].shape[0]
-                    tmp_v[:d1] += w[m][k] * lens[m]
-                    count[k][:d1] += lens[m]
-            else:
-                d1 = w[m][k].shape[0]
-                tmp_v[:d1] += w[m][k] * lens[m]
-                count[k][:d1] += lens[m]
+            if k not in w[m]:
+                continue
+            if v.dim() == 0:
+                tmp_v += w[m][k] * lens[m]
+                count[k] += lens[m]
+                continue
+            _accumulate_param(k, tmp_v, count[k], w[m][k], lens[m])
 
         tmp_v[count[k] > 0] = tmp_v[count[k] > 0].div_(count[k][count[k] > 0])
         tmp_v[count[k] == 0] = global_model_param[k][count[k] == 0]
@@ -93,26 +159,137 @@ def Aggregation_ScaleFL(w, lens, grad_info, global_model_param):
         count[k] = v.new_zeros(v.size(), dtype=torch.float32)
         tmp_v = v.new_zeros(v.size(), dtype=torch.float32)
         for m in range(len(w)):  # 遍历所有用户
-            if grad_info[m][idx]:
-                if parameter_type == 'weight':
-                    if v.dim() > 1:  # 卷积  和 线性层
-                        d1 = w[m][k].shape[0]
-                        d2 = w[m][k].shape[1]
-                        tmp_v[:d1, :d2] += w[m][k] * lens[m]  # 第m个客户端的 k 层参数
-                        count[k][:d1, :d2] += lens[m]
-                    else:  # BN层
-                        d1 = w[m][k].shape[0]
-                        tmp_v[:d1] += w[m][k] * lens[m]
-                        count[k][:d1] += lens[m]
-                else:
-                    d1 = w[m][k].shape[0]
-                    tmp_v[:d1] += w[m][k] * lens[m]
-                    count[k][:d1] += lens[m]
+            if isinstance(grad_info[m], dict):
+                has_grad = grad_info[m].get(k, False)
+            else:
+                has_grad = idx < len(grad_info[m]) and grad_info[m][idx]
+
+            if has_grad and k in w[m]:
+                if v.dim() == 0:
+                    tmp_v += w[m][k] * lens[m]
+                    count[k] += lens[m]
+                    continue
+                _accumulate_param(k, tmp_v, count[k], w[m][k], lens[m])
 
         tmp_v[count[k] > 0] = tmp_v[count[k] > 0].div_(count[k][count[k] > 0])
         tmp_v[count[k] == 0] = global_model_param[k][count[k] == 0]
         w_avg[k] = tmp_v
 
+    return w_avg
+
+
+def _rolling_indices(global_dim, local_dim, round_idx, device):
+    if local_dim > global_dim:
+        raise ValueError(f"Local dim {local_dim} exceeds global dim {global_dim}")
+    if local_dim == global_dim:
+        return torch.arange(global_dim, device=device)
+    start = int(round_idx) % int(global_dim)
+    return (torch.arange(local_dim, device=device) + start) % global_dim
+
+
+def _qkv_rolling_indexers(key, global_v, local_v, round_idx):
+    if _is_qkv_weight(key, global_v):
+        global_qkv_dim = global_v.size(0) // 3
+        local_qkv_dim = local_v.size(0) // 3
+        qkv_idx = _rolling_indices(global_qkv_dim, local_qkv_dim, round_idx, global_v.device)
+        qkv_idx = torch.cat([
+            qkv_idx,
+            qkv_idx + global_qkv_dim,
+            qkv_idx + global_qkv_dim * 2,
+        ])
+        input_idx = _rolling_indices(global_v.size(1), local_v.size(1), round_idx, global_v.device)
+        return [qkv_idx, input_idx]
+    if _is_qkv_bias(key, global_v):
+        global_qkv_dim = global_v.size(0) // 3
+        local_qkv_dim = local_v.size(0) // 3
+        qkv_idx = _rolling_indices(global_qkv_dim, local_qkv_dim, round_idx, global_v.device)
+        return [torch.cat([
+            qkv_idx,
+            qkv_idx + global_qkv_dim,
+            qkv_idx + global_qkv_dim * 2,
+        ])]
+    return None
+
+
+def _rolling_indexers(key, global_v, local_v, round_idx):
+    qkv_indexers = _qkv_rolling_indexers(key, global_v, local_v, round_idx)
+    if qkv_indexers is not None:
+        return qkv_indexers
+    return [
+        _rolling_indices(global_dim, local_dim, round_idx, global_v.device)
+        for global_dim, local_dim in zip(global_v.shape, local_v.shape)
+    ]
+
+
+def _select_by_indexers(source, indexers):
+    selected = source
+    for dim, idx in enumerate(indexers):
+        if idx.numel() == selected.size(dim) and torch.equal(idx, torch.arange(selected.size(dim), device=idx.device)):
+            continue
+        selected = selected.index_select(dim, idx)
+    return selected
+
+
+def split_model_fedrolex(global_param, slim_param, round_idx):
+    """Extract a rolling-width submodel from the global model."""
+    param = copy.deepcopy(slim_param)
+    for k, v in param.items():
+        if k not in global_param:
+            continue
+        global_v = global_param[k]
+        if v.shape == global_v.shape or v.dim() == 0:
+            param[k] = global_v.detach().clone()
+            continue
+        indexers = _rolling_indexers(k, global_v, v, round_idx)
+        param[k] = _select_by_indexers(global_v, indexers).detach().clone()
+    return param
+
+
+def _meshgrid(indexers):
+    try:
+        return torch.meshgrid(*indexers, indexing="ij")
+    except TypeError:
+        return torch.meshgrid(*indexers)
+
+
+def _accumulate_rolling_param(key, tmp_v, count_v, local_v, sample_count, round_idx):
+    if local_v.shape == tmp_v.shape:
+        tmp_v += local_v.to(dtype=tmp_v.dtype) * sample_count
+        count_v += sample_count
+        return
+    indexers = _rolling_indexers(key, tmp_v, local_v, round_idx)
+    grid = _meshgrid(indexers)
+    tmp_v[grid] += local_v.to(dtype=tmp_v.dtype) * sample_count
+    count_v[grid] += sample_count
+
+
+def Aggregation_FedRolex(w, lens, global_model_param, round_idx):
+    """Aggregate rolling submodel updates back into the global model."""
+    w_avg = copy.deepcopy(global_model_param)
+    for k, v in w_avg.items():
+        if not torch.is_floating_point(v):
+            w_avg[k] = global_model_param[k]
+            continue
+
+        count_v = v.new_zeros(v.size(), dtype=torch.float32)
+        tmp_v = v.new_zeros(v.size(), dtype=torch.float32)
+        for local_state, sample_count in zip(w, lens):
+            if k not in local_state:
+                continue
+            local_v = local_state[k]
+            if v.dim() == 0:
+                tmp_v += local_v.to(dtype=tmp_v.dtype) * sample_count
+                count_v += sample_count
+                continue
+            _accumulate_rolling_param(k, tmp_v, count_v, local_v, sample_count, round_idx)
+
+        updated = count_v > 0
+        if updated.any():
+            tmp_v[updated] = tmp_v[updated].div_(count_v[updated])
+            tmp_v[~updated] = global_model_param[k][~updated]
+            w_avg[k] = tmp_v.to(dtype=v.dtype)
+        else:
+            w_avg[k] = global_model_param[k]
     return w_avg
 
 

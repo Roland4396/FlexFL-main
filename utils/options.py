@@ -3,6 +3,15 @@
 # Python version: 3.6
 
 import argparse
+import sys
+
+
+def _arg_supplied(*flags):
+    for item in sys.argv[1:]:
+        for flag in flags:
+            if item == flag or item.startswith(flag + "="):
+                return True
+    return False
 
 
 def args_parser():
@@ -14,7 +23,7 @@ def args_parser():
     parser.add_argument('--local_ep', type=int, default=5, help="the number of local epochs: E")
     parser.add_argument('--local_bs', type=int, default=50, help="local batch size: B")
     parser.add_argument('--bs', type=int, default=128, help="test batch size")
-    parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
+    parser.add_argument('--optimizer', type=str, default='sgd', choices=['sgd', 'adam', 'adamw', 'adaBelief'], help='the optimizer')
     parser.add_argument('--lr', type=float, default=0.01, help="learning rate")
     parser.add_argument('--lr_decay', type=float, default=0.998, help="learning rate decay")
     parser.add_argument('--momentum', type=float, default=0.5, help="SGD momentum (default: 0.5)")
@@ -71,7 +80,7 @@ def args_parser():
 
     # ScaleFL
     parser.add_argument("--client_chosen_mode", default='available', type=str,
-                        help="available \ fit \ random \ RL 客户端的资源是否是固定 还是以高斯分布动态的")
+                        help="available / fit / random / RL 客户端的资源是否是固定还是以高斯分布动态的")
     parser.add_argument("--depth_saved", default=[4, 6, 8], type=int, nargs='*',
                         help="the index of network start channel slim.")  # vgg 采用4-6-8 resnet采用2-3-4 其中resnet是用block为最小单位
     parser.add_argument("--width_ration", default=[0.4, 0.66, 1.0], type=float, nargs='*',
@@ -102,6 +111,25 @@ def args_parser():
                         help="resource limits (contains uncertainty)")
     parser.add_argument("--decrease", default='0.1', type=float,
                         help="adaptive decrease model")
+    parser.add_argument("--image_size", default=None, type=int,
+                        help="input image size override; ViT uses 224 to match SmartFL")
+    parser.add_argument("--save_checkpoint_dir", default="", type=str,
+                        help="directory for final model checkpoints; empty disables checkpoint saving")
 
     args = parser.parse_args()
+    if args.model == "vit" and args.image_size is None:
+        args.image_size = 224
+    if args.model == "vit":
+        if not _arg_supplied("--local_bs"):
+            args.local_bs = 50 if args.dataset == "TinyImagenet" else 16
+        if not _arg_supplied("--bs"):
+            args.bs = args.local_bs
+        if not _arg_supplied("--optimizer"):
+            args.optimizer = "adamw"
+        if not _arg_supplied("--lr"):
+            args.lr = 5e-4
+        if not _arg_supplied("--lr_decay"):
+            args.lr_decay = 1.0
+        if not _arg_supplied("--weight_decay"):
+            args.weight_decay = 0.05
     return args

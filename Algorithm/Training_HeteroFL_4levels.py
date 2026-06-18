@@ -17,14 +17,14 @@ import copy
 import numpy as np
 from tqdm import tqdm
 
-from Algorithm.Training_FlexFL import calculateScale, modelList
+from arch_profiles import build_width_only_scale_list
 from models.Fed import Aggregation_FedSlim, split_model
-from getAPOZ import getNet
+from getAPOZ import modelList
 from models import ResNet18_cifar, MobileNetV2
 from models.Fed import get_model_list, select_clients, summon_clients, FlexFL_select_clients
 from models.vgg import vgg_16_bn
 from utils.Clients import Clients
-from utils.utils import save_result, my_save_result, get_final_acc
+from utils.utils import save_model_checkpoints, save_result, my_save_result, get_final_acc
 from models.test import test_img, test
 from models.Update import DatasetSplit, LocalUpdate_FedAvg
 from optimizer.Adabelief import AdaBelief
@@ -86,49 +86,19 @@ def HeteroFL_4levels(args, dataset_train, dataset_test, dict_users):
             print(net_slim_info[idx])
             accDict[f"{idx}-acc"] = (test(net, dataset_test, args))
         upload_data(args, run, iter, accDict, avg_acc, net_slim_info)
+    save_model_checkpoints(
+        args,
+        net_glob_list,
+        metadata={
+            "scale_list": scaleList,
+            "net_slim_info": net_slim_info,
+        },
+    )
     endrun(run)
 
 
 def calculateScaleHeteroFL_4levels(args):
-    """
-    Calculate scale rates for 4 model levels
-    Target parameter ratios: 1/8 (12.5%), 1/4 (25%), 1/2 (50%), 1 (100%)
-
-    Since HeteroFL uses uniform scaling across all layers,
-    we use scale values that achieve the target parameter ratios
-    """
-
-    # For HeteroFL, parameter ratio ≈ scale^2 (approximately)
-    # So scale = sqrt(parameter_ratio)
-    scale_values = [
-        np.sqrt(0.125),  # sqrt(1/8) ≈ 0.354
-        np.sqrt(0.25),   # sqrt(1/4) = 0.5
-        np.sqrt(0.5),    # sqrt(1/2) ≈ 0.707
-        1.0              # full model
-    ]
-
-    # Create rate arrays for each level
-    # In HeteroFL/FlexFL, rate is an array for each layer
-    # For uniform scaling, all layers use the same rate
-    scaleList = []
-
-    # Get a sample network to determine the number of layers
-    net_glob = getNet(args, [1] * 50)  # Assuming 50 layers max
-    num_layers = len([p for p in net_glob.features.parameters() if len(p.shape) == 4])  # Count conv layers
-
-    print(f"\nDetected {num_layers} convolutional layers in the model")
-
-    # Create rate arrays for each scale level
-    for i, scale in enumerate(scale_values):
-        # Create uniform rate array for all layers
-        rate_array = np.ones(num_layers) * scale
-        scaleList.append(torch.tensor(rate_array, dtype=torch.float32))
-
-        # Calculate and print expected parameter ratio
-        expected_params = scale ** 2
-        print(f"Level {i+1}: scale={scale:.3f}, expected params ratio={expected_params:.3f}")
-
-    return scaleList
+    return build_width_only_scale_list(args)
 
 
 def calculateScaleHeteroFL_4levels_adaptive(args, net_glob, APOZ):

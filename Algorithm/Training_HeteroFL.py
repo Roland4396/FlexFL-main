@@ -13,9 +13,9 @@ import copy
 import numpy as np
 from tqdm import tqdm
 
-from Algorithm.Training_FlexFL import calculateScale, modelList
+from arch_profiles import build_width_only_scale_list
 from models.Fed import Aggregation_FedSlim, split_model
-from getAPOZ import getNet
+from getAPOZ import getNet, modelList
 from models import ResNet18_cifar, MobileNetV2
 from models.Fed import get_model_list, select_clients, summon_clients, FlexFL_select_clients
 from models.vgg import vgg_16_bn
@@ -73,26 +73,4 @@ def HeteroFL(args, dataset_train, dataset_test, dict_users):
 
 
 def calculateScaleHeteroFL(args, net_glob, APOZ):
-    ans = [np.ones(len(APOZ))]
-    originFeatureParams = sum(p.numel() for p in net_glob.features.parameters())
-    flag1 = True
-    flag2 = True
-    for gamma in tqdm(range(1, 1000)):
-        temp = APOZ * gamma / 50
-        temp = torch.tensor(temp)
-        net = getNet(args, torch.clamp(temp, min=0.1, max=1))
-        currentParams = sum(p.numel() for p in net.features.parameters())
-        if currentParams / originFeatureParams >= 0.25 and flag1:
-            flag1 = False
-            print("=" * 25 + "25%" + "=" * 25)
-            print(temp)
-            ans.insert(0, temp)
-        elif currentParams / originFeatureParams >= 0.5 and flag2:
-            flag2 = False
-            print("=" * 25 + "50%" + "=" * 25)
-            print(temp)
-            ans.insert(0, temp)
-        elif not flag1 and not flag2:
-            break
-    ans.sort(key=lambda t: sum(t.tolist()))
-    return ans
+    return build_width_only_scale_list(args)

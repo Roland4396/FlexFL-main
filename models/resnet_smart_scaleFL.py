@@ -39,9 +39,7 @@ class BasicBlock(nn.Module):
 class ResNet110_ScaleFL(nn.Module):
     """
     ResNet110 for ScaleFL with 4 exit points
-    - exit0: Block 27 (约50%深度，1/8参数)
-    - exit1: Block 34 (约63%深度，1/4参数)
-    - exit2: Block 43 (约80%深度，1/2参数)
+    - exit0 / exit1 / exit2 由外部 profile 传入
     - full:  Block 54 (100%深度，全部参数)
     """
     def __init__(self, num_channels=3, num_classes=10, track_running_stats=True, scale=1.0,
@@ -51,6 +49,7 @@ class ResNet110_ScaleFL(nn.Module):
         self.exit0 = exit0
         self.exit1 = exit1
         self.exit2 = exit2
+        self.total_blocks = 54
 
         # 根据scale调整通道数
         base_channels = [16, 32, 64]
@@ -85,43 +84,58 @@ class ResNet110_ScaleFL(nn.Module):
             self.blocks.append(BasicBlock(self.inchannel, channels[2], stride, track_running_stats))
             self.inchannel = channels[2]
 
+        exit_channels = [
+            self._exit_channels(channels, exit0),
+            self._exit_channels(channels, exit1),
+            self._exit_channels(channels, exit2),
+            channels[2],
+        ]
+
         # 为每个退出点创建分类器
         self.classifiers = nn.ModuleList()
 
-        # exit0分类器 (Block 27后，在stage2中间)
+        # 每个分类头的输入通道必须与 exit 实际落到的 stage 对齐。
+        # 否则只要切到 stage3，Linear 就会出现维度不匹配。
         self.classifiers.append(nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(channels[1], num_classes)  # 32*scale channels
+            nn.Linear(exit_channels[0], num_classes)
         ))
 
-        # exit1分类器 (Block 34后，在stage2末尾附近)
         self.classifiers.append(nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(channels[1], num_classes)  # 32*scale channels
+            nn.Linear(exit_channels[1], num_classes)
         ))
 
-        # exit2分类器 (Block 43后，在stage3中间)
         self.classifiers.append(nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(channels[2], num_classes)  # 64*scale channels
+            nn.Linear(exit_channels[2], num_classes)
         ))
 
         # 完整模型分类器
         self.classifiers.append(nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(channels[2], num_classes)  # 64*scale channels
+            nn.Linear(exit_channels[3], num_classes)
         ))
+
+    def _exit_channels(self, channels, exit_block):
+        if not 1 <= exit_block <= self.total_blocks:
+            raise ValueError(f"exit_block must be in [1, {self.total_blocks}], got {exit_block}")
+        if exit_block <= 18:
+            return channels[0]
+        if exit_block <= 36:
+            return channels[1]
+        return channels[2]
 
     def forward(self, x, ee=1):
         """
         Forward with early exit
-        ee=1: exit at block 27 (exit0)
-        ee=2: exit at block 34 (exit1)
-        ee=3: exit at block 43 (exit2)
+        ee=1: exit at configured exit0
+        ee=2: exit at configured exit1
+        ee=3: exit at configured exit2
         ee=4: full model (all 54 blocks)
         """
         x = self.conv1(x)

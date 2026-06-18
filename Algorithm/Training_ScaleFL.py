@@ -5,31 +5,58 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 
+from arch_profiles import get_scalefl_profile
 from models.Fed import split_model, select_clients, Aggregation_ScaleFL, summon_clients, FlexFL_select_clients
 from models.mobileNetV2_scaleFL import MobileNetV2_scaleFL
 from models.resnet_scaleFL import ResNet18_cifar_scaleFL
 from models.resnet_smart_scaleFL import ResNet110_cifar_scaleFL
-
+from models.vit_flexfl import vit_small_scalefl
 from models.vgg_scaleFL import vgg_16_scaleFL
-from utils.utils import my_save_result, get_final_acc
+from utils.utils import my_save_result, get_final_acc, save_model_checkpoints
 from models.Update import LocalUpdate_ScaleFL
 from wandbUtils import upload_data, endrun, init_run
 
 
 def ScaleFL(args, dataset_train, dataset_test, dict_users):
-    model_rate = args.width_ration
+    profile = get_scalefl_profile(args) if args.model in {"vgg", "resnet_smart", "vit"} else None
+    model_rate = list(profile["scales"]) if profile is not None else args.width_ration
+    exit0, exit1, exit2 = profile["exits"] if profile is not None else (6, 8, 10)
     run = init_run(args, "Fed-Experiment")
     net_glob_list = []
     net_slim_info = []
     for i in model_rate:
         if args.model == 'vgg':
-            net = vgg_16_scaleFL(num_classes=args.num_classes, track_running_stats=False, num_channels=args.num_channels, scale=i)
+            net = vgg_16_scaleFL(
+                num_classes=args.num_classes,
+                track_running_stats=False,
+                num_channels=args.num_channels,
+                scale=i,
+                exit0=exit0,
+                exit1=exit1,
+                exit2=exit2,
+            )
         elif args.model == 'resnet':
             net = ResNet18_cifar_scaleFL(num_channels=args.num_channels, num_classes=args.num_classes, track_running_stats=False, scale=i)
         elif args.model == 'resnet_smart':
-            net = ResNet110_cifar_scaleFL(num_channels=args.num_channels, num_classes=args.num_classes, track_running_stats=False, scale=i)
+            net = ResNet110_cifar_scaleFL(
+                num_channels=args.num_channels,
+                num_classes=args.num_classes,
+                track_running_stats=False,
+                scale=i,
+                exit0=exit0,
+                exit1=exit1,
+                exit2=exit2,
+            )
         elif args.model == 'mobilenet':
             net = MobileNetV2_scaleFL(num_channels=args.num_channels, num_classes=args.num_classes, trs=False, scale=i)
+        elif args.model == 'vit':
+            net = vit_small_scalefl(
+                num_classes=args.num_classes,
+                num_channels=args.num_channels,
+                image_size=args.image_size,
+                scale=i,
+                exits=(exit0, exit1, exit2),
+            )
 
         total = sum([param.nelement() for param in net.parameters()])
         net.to(args.device)
@@ -38,7 +65,7 @@ def ScaleFL(args, dataset_train, dataset_test, dict_users):
         print('【model config】  model_name:{}, width:{} , param:{}MB'.format(args.model, i, total * 4 / 1e6))
         print(net)
         net_glob_list.append(net)
-        net_slim_info.append((i, total * 4 / 1e6))  # 宽度 深度 参数量
+        net_slim_info.append((i, (exit0, exit1, exit2), total * 4 / 1e6))  # 宽度 退出点 参数量
 
     # training
     acc_list = [[] for _ in net_glob_list]
@@ -81,6 +108,19 @@ def ScaleFL(args, dataset_train, dataset_test, dict_users):
             print(net_slim_info[idx])
             accDict[f"{idx}-acc"] = test_scaleFL(net, dataset_test, args, ee=idx + 1)
         upload_data(args, run, iter, accDict, avg_acc, net_slim_info)
+    save_model_checkpoints(
+        args,
+        net_glob_list,
+        metadata={
+            "profile": profile,
+            "scales": model_rate,
+            "exits": (exit0, exit1, exit2),
+            "net_slim_info": net_slim_info,
+            "kd_gamma": args.gamma,
+            "kd_T": args.T,
+            "kd_active_after_round": args.epochs * 0.25,
+        },
+    )
     endrun(run)
 
 

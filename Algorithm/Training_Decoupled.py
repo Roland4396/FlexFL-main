@@ -11,13 +11,14 @@ import copy
 import numpy as np
 from tqdm import tqdm
 
+from arch_profiles import build_vit_mlp_only_scale_list
 from Algorithm.Training_HeteroFL import calculateScaleHeteroFL
 from getAPOZ import modelList, getNet
 from models import ResNet18_cifar
 from models.Fed import Aggregation, get_model_list, split_model, summon_clients, FlexFL_select_clients
 from models.vgg import vgg_16_bn
 from utils.Clients import Clients
-from utils.utils import save_result, my_save_result, get_final_acc
+from utils.utils import save_model_checkpoints, save_result, my_save_result, get_final_acc
 from models.test import test_img, test
 from models.Update import DatasetSplit, LocalUpdate_FedAvg
 from optimizer.Adabelief import AdaBelief
@@ -26,7 +27,10 @@ from wandbUtils import init_run, upload_data, endrun
 
 def Decoupled(args, dataset_train, dataset_test, dict_users):
     net_glob = getNet(args, [1] * 50)
-    scaleList = calculateScaleHeteroFL(args, net_glob, np.array([0.5] * 20))
+    if args.model == "vit":
+        scaleList = build_vit_mlp_only_scale_list(args)
+    else:
+        scaleList = calculateScaleHeteroFL(args, net_glob, np.array([0.5] * 20))
     net_glob_list, net_slim_info = modelList(args, scaleList)
 
     my_list = list(map(float, args.client_hetero_ration.split(':')))
@@ -70,4 +74,13 @@ def Decoupled(args, dataset_train, dataset_test, dict_users):
             print(net_slim_info[id])
             accDict[f"{id}-acc"] = (test(net_glob_list[id], dataset_test, args))
         upload_data(args, run, iter, accDict, avg_acc, net_slim_info)
+    save_model_checkpoints(
+        args,
+        net_glob_list,
+        metadata={
+            "scale_list": scaleList,
+            "net_slim_info": net_slim_info,
+            "metric": "client-ratio-weighted level accuracy",
+        },
+    )
     endrun(run)

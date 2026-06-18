@@ -10,13 +10,15 @@ import wandb
 from torch import nn
 from tqdm import tqdm
 
-from models import vgg_16_bn, ResNet18_cifar, ResNet18_SmartFL, MobileNetV2, test, LocalUpdate_FedAvg, Aggregation
+from models import vgg_16_bn, ResNet18_cifar, ResNet18_SmartFL, MobileNetV2, vit_small_flexfl, test, LocalUpdate_FedAvg, Aggregation
+from models.vit_flexfl import vit_rate_uses_hidden_width, vit_width_mode_from_args
 from optimizer.Adabelief import AdaBelief
 from utils.Clients import Clients
 from utils.get_dataset import get_dataset
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 from functools import partial
+from models.Update import _build_optimizer
 
 
 def hook(args, net, dataset_test, iter, run=None):
@@ -33,6 +35,8 @@ def hook(args, net, dataset_test, iter, run=None):
         reluCount = [1, 18, 18, 36, 36]
     elif args.model == "mobilenet":
         reluCount = [1, 2, 4, 6, 8, 6, 6, 2, 1]
+    elif args.model == "vit":
+        reluCount = [3, 3, 3, 3]
     else:
         assert "unrecognized model"
     APOZ = [[] for _ in range(sum(reluCount))]
@@ -58,6 +62,14 @@ def hook(args, net, dataset_test, iter, run=None):
                 if isinstance(layer, torch.nn.ReLU6):
                     relu_layers.append((name, layer))
             for idx, layer in enumerate(relu_layers):
+                _hook = layer[1].register_forward_hook(partial(calculate_zero_ratio, layer_idx=idx))
+                hooks.append(_hook)
+        elif args.model == "vit":
+            gelu_layers = []
+            for idx, (name, layer) in enumerate(model.named_modules()):
+                if isinstance(layer, torch.nn.GELU):
+                    gelu_layers.append((name, layer))
+            for idx, layer in enumerate(gelu_layers):
                 _hook = layer[1].register_forward_hook(partial(calculate_zero_ratio, layer_idx=idx))
                 hooks.append(_hook)
         else:
@@ -118,7 +130,10 @@ def APOZfunction(args, run, run_round=0):
 
     # START PRETRAIN
     for _iter in tqdm(range(args.pretrain)):
-        optimizer = torch.optim.Adam(net_glob.parameters(), lr=0.001)
+        if args.model == "vit":
+            optimizer = _build_optimizer(args, net_glob.parameters(), _iter)
+        else:
+            optimizer = torch.optim.Adam(net_glob.parameters(), lr=0.001)
         Predict_loss = 0
         for batch_idx, (images, labels) in enumerate(ldr_train):
             images, labels = images.to(args.device), labels.to(args.device)
@@ -147,7 +162,49 @@ def getNet(args, rate):
     elif args.model == "mobilenet":
         net = MobileNetV2(channels=args.num_channels, num_classes=args.num_classes, trs=False, rate=rate).to(
             args.device)
+    elif args.model == "vit":
+        net = vit_small_flexfl(
+            num_classes=args.num_classes,
+            num_channels=args.num_channels,
+            rate=rate,
+            image_size=args.image_size,
+            width_mode=vit_width_mode_from_args(args),
+        ).to(args.device)
     return net
+
+
+def get_active_param_count(args, rate, net):
+    if args.model != "vit":
+        return sum(param.nelement() for param in net.parameters())
+    from models.vit_flexfl import (
+        VIT_DEPTH,
+        vit_active_params,
+        vit_rate_uses_hidden_width,
+        vit_total_params,
+    )
+
+    image_size = args.image_size
+    rate_values = rate.tolist() if hasattr(rate, "tolist") else list(rate)
+    stage_rates = [float(value) for value in rate_values[:4]]
+    exit_loc = int(round(float(rate_values[4]))) if len(rate_values) >= 5 else VIT_DEPTH
+    width_mode = "hidden" if vit_rate_uses_hidden_width(rate_values) else "mlp"
+    if exit_loc >= VIT_DEPTH:
+        return vit_total_params(
+            stage_rates,
+            image_size,
+            args.num_classes,
+            args.num_channels,
+            width_mode=width_mode,
+        )
+    return vit_active_params(
+        stage_rates,
+        (exit_loc,),
+        1,
+        image_size,
+        args.num_classes,
+        args.num_channels,
+        width_mode=width_mode,
+    )
 
 
 def calculate_average(input_list, reluCount):
@@ -217,12 +274,13 @@ def modelList(args, scaleList):
     for rate in netRateList:
         net = getNet(args, rate)
         totalParam = sum([param.nelement() for param in net.parameters()])
+        activeParam = get_active_param_count(args, rate, net)
         featureParam = sum([param.nelement() for param in net.features.parameters()])
         net.to(args.device)
         net.train()
         print("==" * 50)
         print(
-            f'[model config]  model_name:{args.model}, totalParam:{totalParam} , featureParam:{featureParam}, rate:{rate}')
+            f'[model config]  model_name:{args.model}, totalParam:{totalParam} , activeParam:{activeParam}, featureParam:{featureParam}, rate:{rate}')
         netGlobList.append(net)
         netSlimInfo.append(rate)
     return netGlobList, netSlimInfo

@@ -8,10 +8,12 @@ from datetime import datetime
 import numpy as np
 from tqdm import tqdm
 
+from arch_profiles import build_flexfl_scale_list, supports_aligned_profiles
 # Local application imports
 from getAPOZ import APOZfunction, getNet, hook, modelList, calculateScale, get_net_scale
 from models import vgg_16_bn, LocalUpdate_FedAvg, test, ResNet18_cifar, LocalUpdate_FlexFL, MobileNetV2
 from models.Fed import get_model_list, Aggregation_FedSlim, split_model, select_clients, summon_clients, FlexFL_select_clients
+from utils.utils import save_model_checkpoints
 from wandbUtils import init_run, upload_data, endrun
 
 layer_idx = 0
@@ -99,14 +101,20 @@ def FlexFL(args, dataset_train, dataset_test, dict_users):
         APOZ_preset_dict[21] = [0.5097244852679033, 0.5414625456118408, 0.53440625470716, 0.5289973941162911,
                                 0.544731853456766, 0.557808814034645, 0.6352266105868872,
                                 0.6558780787403093, 0.7671015852076166]  # mobilenet femnist
-        APOZ = APOZ_preset_dict[args.apoz]
+        if supports_aligned_profiles(args) and args.model == "vit":
+            APOZ = None
+        else:
+            APOZ = APOZ_preset_dict[args.apoz]
 
     print("==" * 50)
     print("Current APOZ set as:")
     print(APOZ)
 
     # Calculate scaling rate
-    scale_rate, scaleList = calculateScale(args, net_glob, APOZ)
+    if supports_aligned_profiles(args):
+        scale_rate, scaleList = build_flexfl_scale_list(args, APOZ)
+    else:
+        scale_rate, scaleList = calculateScale(args, net_glob, APOZ)
     netGlobList, netSlimInfo = modelList(args, scaleList)
     print(netSlimInfo)
     endrun(run)
@@ -151,4 +159,18 @@ def FlexFL(args, dataset_train, dataset_test, dict_users):
             print(netSlimInfo[idx])
             accDict[f"{idx}-acc"] = (test(net, dataset_test, args))
         upload_data(args, run, _iter, accDict, avg_acc, netSlimInfo)
+    save_model_checkpoints(
+        args,
+        netGlobList,
+        metadata={
+            "scale_rate": scale_rate,
+            "scale_list": scaleList,
+            "net_slim_info": netSlimInfo,
+            "pretrain": args.pretrain,
+            "apoz": args.apoz,
+            "only": args.only,
+            "gamma": args.gamma,
+            "T": args.T,
+        },
+    )
     endrun(run)
